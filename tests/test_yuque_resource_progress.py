@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from plugins.yuque.backend.export_yuque import localize_resources
+from plugins.yuque.backend.export_yuque import localize_resources, normalize_resources
 
 
 class YuqueResourceProgressTests(unittest.TestCase):
@@ -93,6 +93,46 @@ class YuqueResourceProgressTests(unittest.TestCase):
         self.assertNotIn("X-Amz-Signature", serialized)
         self.assertNotIn("secret", serialized)
         self.assertIn("https://cdn.example.com/file.png", serialized)
+
+    def test_normalize_resources_upgrades_http_urls(self) -> None:
+        normalized = normalize_resources(
+            [
+                {"url": "http://cdn.example.com/a.doc", "kind": "attachment", "title": "a"},
+                {"url": "http://cdn.example.com/b.png", "kind": "image", "title": "b"},
+            ],
+            ["http://cdn.example.com/c.png"],
+        )
+        self.assertEqual(
+            [item["url"] for item in normalized],
+            [
+                "https://cdn.example.com/a.doc",
+                "https://cdn.example.com/b.png",
+                "https://cdn.example.com/c.png",
+            ],
+        )
+        self.assertTrue(all(item["url"].startswith("https://") for item in normalized))
+
+    def test_localize_resources_replaces_http_form_in_markdown(self) -> None:
+        markdown = "[合同](http://cdn.example.com/contract.doc)"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "attachments" / "contract.doc"
+            target.parent.mkdir()
+            target.write_bytes(b"doc")
+            with patch("plugins.yuque.backend.export_yuque.download_resource", return_value=target):
+                updated, success, failures = localize_resources(
+                    markdown,
+                    [{"url": "https://cdn.example.com/contract.doc", "kind": "attachment", "title": "合同"}],
+                    root / "doc.md",
+                    timeout=30,
+                    keep_remote=True,
+                    cookies=[],
+                    download_attachments=True,
+                )
+        self.assertEqual(success, {"image": 0, "attachment": 1})
+        self.assertEqual(failures, [])
+        self.assertNotIn("http://cdn.example.com/contract.doc", updated)
+        self.assertIn("attachments/contract.doc", updated)
 
 
 if __name__ == "__main__":

@@ -232,6 +232,9 @@
         "placeholder": {
           "type": "string"
         },
+        "help": {
+          "type": "string"
+        },
         "markdown": {
           "type": "string"
         },

@@ -5572,7 +5572,8 @@ function manifestFieldErrorId(provider, field) {
 }
 
 function manifestFieldInputAttributes(provider, field, options = {}) {
-  const attributes = [`aria-describedby="${manifestFieldErrorId(provider, field)}"`];
+  const describedBy = options.describedBy || manifestFieldErrorId(provider, field);
+  const attributes = [`aria-describedby="${describedBy}"`];
   if (field.required) attributes.push('required', 'aria-required="true"');
   if (options.number && field.min !== undefined) attributes.push(`min="${escapeHtml(field.min)}"`);
   if (options.number && field.max !== undefined) attributes.push(`max="${escapeHtml(field.max)}"`);
@@ -5584,12 +5585,22 @@ function renderManifestFieldError(provider, field) {
   return `<p class="form-field-error" id="${manifestFieldErrorId(provider, field)}" role="alert" hidden></p>`;
 }
 
+function renderManifestFieldHelp(provider, field) {
+  const text = String(field.help || '').trim();
+  if (!text) return '';
+  return `<p class="field-hint" id="${manifestFieldId(provider, field)}-help">${escapeHtml(text)}</p>`;
+}
+
 function renderManifestField(provider, field) {
   const id = manifestFieldId(provider, field);
   const label = escapeHtml(field.label || field.name);
   const required = field.required ? ' <span class="required">*</span>' : '';
   const placeholder = escapeHtml(field.placeholder || '');
   const value = escapeHtml(field.default ?? '');
+  const helpHtml = renderManifestFieldHelp(provider, field);
+  const describedBy = [manifestFieldErrorId(provider, field), helpHtml ? `${id}-help` : '']
+    .filter(Boolean)
+    .join(' ');
   const sensitiveMetadata = [field.name, field.label, field.arg, field.autocomplete].join(' ');
   const draftSensitive = field.sensitive === true || field.secret === true
     || /(?:(?:app|client)[-_.\s]*id|api[-_.\s]*key|access[-_.\s]*key|private[-_.\s]*key|import[-_.\s]*mount[-_.\s]*key|(?:knowledge[-_.\s]*base|folder|space)[-_.\s]*id|token|cookie|password|passwd|secret|signature|authorization|credential|session|bearer|csrf|username|user[-_.\s]*name|email|phone|account|webhook|dsn)/i.test(sensitiveMetadata);
@@ -5605,7 +5616,8 @@ function renderManifestField(provider, field) {
     return `
       <div class="form-group">
         <label for="${id}">${label}${required}</label>
-        <textarea id="${id}" placeholder="${placeholder}" rows="${field.rows || 6}"${manifestFieldInputAttributes(provider, field)}${draftSensitiveAttr}>${value}</textarea>
+        <textarea id="${id}" placeholder="${placeholder}" rows="${field.rows || 6}"${manifestFieldInputAttributes(provider, field, { describedBy })}${draftSensitiveAttr}>${value}</textarea>
+        ${helpHtml}
         ${renderManifestFieldError(provider, field)}
       </div>
     `;
@@ -5614,9 +5626,10 @@ function renderManifestField(provider, field) {
     return `
       <div class="form-group form-group-checkbox">
         <label class="checkbox-label">
-          <input type="checkbox" id="${id}" ${field.default ? 'checked' : ''}${manifestFieldInputAttributes(provider, field)}${draftSensitiveAttr}>
+          <input type="checkbox" id="${id}" ${field.default ? 'checked' : ''}${manifestFieldInputAttributes(provider, field, { describedBy })}${draftSensitiveAttr}>
           <span>${label}${required}</span>
         </label>
+        ${helpHtml}
         ${renderManifestFieldError(provider, field)}
       </div>
     `;
@@ -5630,7 +5643,8 @@ function renderManifestField(provider, field) {
     return `
       <div class="form-group">
         <label for="${id}">${label}${required}</label>
-        <select id="${id}"${manifestFieldInputAttributes(provider, field)}${draftSensitiveAttr}>${options}</select>
+      <select id="${id}"${manifestFieldInputAttributes(provider, field, { describedBy })}${draftSensitiveAttr}>${options}</select>
+        ${helpHtml}
         ${renderManifestFieldError(provider, field)}
       </div>
     `;
@@ -5641,9 +5655,10 @@ function renderManifestField(provider, field) {
       <div class="form-group">
         <label for="${id}">${label}${required}</label>
         <div class="input-with-button">
-          <input type="text" id="${id}" placeholder="${placeholder}" value="${value}"${manifestFieldInputAttributes(provider, field)}${draftSensitiveAttr}${recentAttrs}>
+          <input type="text" id="${id}" placeholder="${placeholder}" value="${value}"${manifestFieldInputAttributes(provider, field, { describedBy })}${draftSensitiveAttr}${recentAttrs}>
           <button class="btn-secondary" id="${id}-browse" type="button">${buttonLabel}</button>
         </div>
+        ${helpHtml}
         ${renderManifestFieldError(provider, field)}
       </div>
     `;
@@ -5652,7 +5667,8 @@ function renderManifestField(provider, field) {
   return `
     <div class="form-group">
       <label for="${id}">${label}${required}</label>
-      <input type="${inputType}" id="${id}" placeholder="${placeholder}" value="${value}"${manifestFieldInputAttributes(provider, field, { number: field.type === 'number' })}${draftSensitiveAttr}${recentAttrs}>
+    <input type="${inputType}" id="${id}" placeholder="${placeholder}" value="${value}"${manifestFieldInputAttributes(provider, field, { number: field.type === 'number', describedBy })}${draftSensitiveAttr}${recentAttrs}>
+      ${helpHtml}
       ${renderManifestFieldError(provider, field)}
     </div>
   `;
@@ -6154,6 +6170,7 @@ function renderGenericProviderForm(provider) {
               <input type="checkbox" id="${provider.id}-incremental" checked>
               <span>增量${actionName}</span>
             </label>
+            <p class="field-hint">跳过本地已导出的内容。后补的附件、图片不会自动下载；需要补下时取消勾选。</p>
           </div>
         </details>
       </section>

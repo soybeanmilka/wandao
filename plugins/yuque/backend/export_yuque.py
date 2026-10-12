@@ -273,7 +273,18 @@ YUQUE_CONVERTER_JS = r"""
   const images = [];
   const resources = [];
   const attachmentNames = new Set(["file", "attachment", "localfile", "doc", "docx", "pdf", "excel", "spreadsheet", "ppt", "archive"]);
-  const downloadableExt = /\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|tar|gz|csv|txt|md|json|xml|mp[34]|mov|avi|wav|m4a)$/i;
+  const downloadableExt = /\.(pdf|docx?|xlsx?|pptx?|rtf|wps|zip|rar|7z|tar|gz|bz2|xz|csv|txt|md|json|xml|ya?ml|log|sql|mp[34]|mov|avi|wav|m4a|epub|mobi|azw3?)$/i;
+  function httpUrl(url) {
+    const value = String(url || "");
+    return value.startsWith("http://") ? "https://" + value.slice(7) : value;
+  }
+  function resourceUrl(data) {
+    if (!data) return "";
+    return data.url || data.src || data.href || data.downloadUrl || data.download_url || data.download || "";
+  }
+  function hasDownloadableExt(url) {
+    return downloadableExt.test(String(url || "").split("#")[0].split("?")[0]);
+  }
   function addResource(url, kind, title, cardName) {
     if (!url) return;
     const resource = { url, kind: kind || "image", title: title || "", cardName: cardName || "" };
@@ -288,17 +299,39 @@ YUQUE_CONVERTER_JS = r"""
   }
   function decodeCard(value) {
     try {
-      if (value && value.startsWith("data:")) value = decodeURIComponent(value.slice(5));
-      return value ? JSON.parse(value) : {};
+      if (!value) return {};
+      let raw = String(value);
+      if (raw.startsWith("data:")) {
+        const body = raw.slice(5);
+        const comma = body.indexOf(",");
+        // data:<media-type>[;base64],<payload>  或  data:<urlencoded-json>
+        const hasMediaType = comma >= 0 && (
+          comma === 0 ||
+          /^[a-z0-9!#$%&'*+.^_`|~-]+\/[a-z0-9!#$%&'*+.^_`|~-]+/i.test(body.slice(0, comma))
+        );
+        if (hasMediaType) {
+          const meta = body.slice(0, comma);
+          const payload = body.slice(comma + 1);
+          raw = /;base64$/i.test(meta) ? atob(payload) : decodeURIComponent(payload);
+        } else {
+          raw = decodeURIComponent(body);
+        }
+      } else if (raw.startsWith("%")) {
+        raw = decodeURIComponent(raw);
+      }
+      return raw ? JSON.parse(raw) : {};
     } catch (_) {
       return {};
     }
   }
   function looksLikeAttachment(name, data, url) {
     const key = String(name || "").toLowerCase();
-    if (attachmentNames.has(key)) return true;
-    if (data && (data.size || data.fileSize || data.file_size || data.filename || data.file_name)) return true;
-    return downloadableExt.test(String(url || ""));
+    const fileMeta = !!(data && (data.size || data.fileSize || data.file_size || data.filename || data.file_name));
+    if (fileMeta) return true;
+    if (hasDownloadableExt(url)) return true;
+    // 关联文档卡片是知识库内链，不是文件附件
+    if (key === "doc" && data && (data.id != null || data.slug)) return false;
+    return attachmentNames.has(key);
   }
   function inline(node) {
     if (node.nodeType === 3) return node.nodeValue.replace(/\s+/g, " ");
@@ -306,7 +339,7 @@ YUQUE_CONVERTER_JS = r"""
     const tag = node.tagName.toLowerCase();
     if (tag === "br") return "\n";
     if (tag === "img") {
-      const src = node.getAttribute("src") || node.getAttribute("data-src") || "";
+      const src = httpUrl(node.getAttribute("src") || node.getAttribute("data-src") || "");
       const alt = node.getAttribute("alt") || "";
       if (src) addResource(src, "image", alt || "image", "img");
       return src ? "![" + alt + "](" + src + ")" : "";
@@ -314,9 +347,11 @@ YUQUE_CONVERTER_JS = r"""
     if (tag === "card" || tag === "lake-card") {
       const name = node.getAttribute("name") || node.getAttribute("type") || "card";
       const data = decodeCard(node.getAttribute("value") || node.getAttribute("data-card-value") || "");
-      if (name === "image" && data.src) {
-        addResource(data.src, "image", data.title || data.name || "image", name);
-        return "![" + (data.title || data.name || "image") + "](" + data.src + ")";
+      const url = httpUrl(resourceUrl(data));
+      if (name === "image" && url) {
+        const imageTitle = data.title || data.name || "image";
+        addResource(url, "image", imageTitle, name);
+        return "![" + imageTitle + "](" + url + ")";
       }
       if (name === "math" && data.code) return "$" + String(data.code).replace(/\n/g, " ") + "$";
       if (name === "codeblock" && data.code) {
@@ -326,12 +361,12 @@ YUQUE_CONVERTER_JS = r"""
         const lang = data.type === "mermaid" ? "mermaid" : (data.type === "puml" ? "plantuml" : (data.type || ""));
         return "\n```" + lang + "\n" + data.code + "\n```\n";
       }
-      if (data.url) {
+      if (url) {
         const title = resourceTitle(data, name);
-        if (looksLikeAttachment(name, data, data.url)) {
-          addResource(data.url, "attachment", title, name);
+        if (looksLikeAttachment(name, data, url)) {
+          addResource(url, "attachment", title, name);
         }
-        return "[" + title + "](" + data.url + ")";
+        return "[" + title + "](" + url + ")";
       }
       return "[" + name + "]";
     }
@@ -340,8 +375,8 @@ YUQUE_CONVERTER_JS = r"""
     if (tag === "em" || tag === "i") return inner.trim() ? "*" + inner + "*" : inner;
     if (tag === "code") return "`" + inner.replace(/`/g, "\\`") + "`";
     if (tag === "a") {
-      const href = node.getAttribute("href") || "";
-      if (href && downloadableExt.test(href)) addResource(href, "attachment", inner.trim(), "link");
+      const href = httpUrl(node.getAttribute("href") || "");
+      if (href && hasDownloadableExt(href)) addResource(href, "attachment", inner.trim(), "link");
       return href && inner.trim() ? "[" + inner.trim() + "](" + href + ")" : inner;
     }
     return inner;
@@ -711,7 +746,12 @@ def _resource_request_headers(
     cookies: list[dict[str, Any]],
     referer: str | None,
 ) -> dict[str, str]:
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+        )
+    }
     # urllib copies manually supplied headers when it follows redirects.  Build
     # every request ourselves and attach cookies only on the original origin.
     if _same_resource_origin(initial_url, url):
@@ -837,12 +877,19 @@ def normalize_resources(resources: list[dict[str, Any]] | list[str], images: lis
         url = resource["url"]
         if not url.startswith(("http://", "https://")):
             continue
+        if url.startswith("http://"):
+            url = "https://" + url[len("http://"):]
+            resource["url"] = url
         key = (url, resource["kind"])
         if key not in seen:
             seen.add(key)
             normalized.append(resource)
     for url in images or []:
-        if isinstance(url, str) and url.startswith(("http://", "https://")) and (url, "image") not in seen:
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        if url.startswith("http://"):
+            url = "https://" + url[len("http://"):]
+        if (url, "image") not in seen:
             seen.add((url, "image"))
             normalized.append({"url": url, "kind": "image", "title": "image"})
     return normalized
@@ -963,7 +1010,10 @@ def localize_resources(
         target_dir = md_path.parent / ("attachments" if kind == "attachment" else "assets")
         try:
             target = download_resource(url, target_dir, timeout, cookies, title, referer)
-            markdown = markdown.replace(url, os.path.relpath(target, md_path.parent).replace("\\", "/"))
+            local_ref = os.path.relpath(target, md_path.parent).replace("\\", "/")
+            markdown = markdown.replace(url, local_ref)
+            if url.startswith("https://"):
+                markdown = markdown.replace("http://" + url[len("https://"):], local_ref)
             success[kind] += 1
             if progress_callback:
                 progress_callback({**progress, "status": "succeeded"})

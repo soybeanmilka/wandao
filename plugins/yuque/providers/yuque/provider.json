@@ -21,8 +21,9 @@
     { "name": "output", "label": "导出根目录", "type": "directory", "arg": "--output", "required": true, "history": "path", "actions": ["export"] },
     { "name": "auto_output_folder", "label": "按来源自动创建子文件夹", "type": "checkbox", "arg": "--auto-output-folder", "falseArg": "--flat-output", "default": true, "actions": ["export"] },
     { "name": "include_source", "label": "显示来源链接", "type": "checkbox", "arg": "--include-source", "falseArg": "--no-source", "default": true, "actions": ["export"] },
-    { "name": "incremental", "label": "增量导出", "type": "checkbox", "arg": "--incremental", "default": true, "advanced": true, "actions": ["export"] },
-    { "name": "update_existing", "label": "更新已有文档", "type": "checkbox", "arg": "--update-existing", "default": false, "advanced": true, "actions": ["export"] },
+    { "name": "incremental_notice", "type": "notice", "advanced": true, "actions": ["export"], "markdown": "若此前导出后又在语雀里新上传了附件或图片：取消勾选「增量导出」全量重导，或勾选「更新已有文档」。`attachments/`、`assets/` 目录会在下载成功时自动创建，无需手动建。" },
+    { "name": "incremental", "label": "增量导出", "type": "checkbox", "arg": "--incremental", "default": true, "advanced": true, "actions": ["export"], "help": "跳过本地已导出的文档。后补的附件、图片不会自动下载；需要补下时取消勾选，或再勾选「更新已有文档」。" },
+    { "name": "update_existing", "label": "更新已有文档", "type": "checkbox", "arg": "--update-existing", "default": false, "advanced": true, "actions": ["export"], "help": "重新处理已有 Markdown，补下新上传的图片和附件，并刷新正文内容。" },
     { "name": "retry_failed", "label": "只重试失败项", "type": "checkbox", "arg": "--retry-failed", "default": false, "advanced": true, "actions": ["export"] },
     { "name": "request_delay", "label": "请求延迟秒", "type": "number", "arg": "--request-delay", "default": 0.8, "min": 0, "step": 0.1, "advanced": true, "actions": ["export"] },
     { "name": "request_jitter", "label": "随机浮动秒", "type": "number", "arg": "--request-jitter", "default": 0.4, "min": 0, "step": 0.1, "advanced": true, "actions": ["export"] }

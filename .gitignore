@@ -79,3 +79,5 @@ crawl4ai-cache/
 /dist-*/
 # 仓库根的发布产物（wandao_electron/release-*/ 已单独覆盖）
 /release-*/
+# 本地插件签名密钥（私钥绝不入库）
+/.local-plugin-key/

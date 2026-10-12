@@ -2819,6 +2819,10 @@ body.markdown-reader-mode .tool-heading {
   margin-top: 7px;
 }
 
+.form-group-checkbox .field-hint {
+  margin-left: 28px;
+}
+
 .setup-card,
 .requirements-card,
 .provider-safety-notice,
