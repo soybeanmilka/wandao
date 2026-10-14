@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import random
+import signal
 import shutil
 import socket
 import struct
@@ -57,6 +58,7 @@ def register_browser_launch(
     exe: str,
     profile_dir: Path,
     proc: subprocess.Popen[Any] | None = None,
+    url: str = "",
 ) -> None:
     """Record how a Chrome process was started so it can be restarted later."""
 
@@ -64,7 +66,25 @@ def register_browser_launch(
         "exe": exe,
         "profile_dir": str(profile_dir),
         "pid": getattr(proc, "pid", None),
+        "proc": proc,
+        "url": url,
     }
+
+
+def terminate_registered_browser(port: int) -> None:
+    """Terminate the browser tree registered for a task-owned debug port."""
+
+    info = _browser_launch_info.pop(int(port), None)
+    if not info:
+        return
+    proc = info.get("proc")
+    pid = info.get("pid")
+    if proc is not None:
+        if proc.poll() is None:
+            terminate_process_tree(proc)
+    elif pid:
+        terminate_pid_tree(int(pid))
+    wait_for_debug_port_closed(int(port), timeout=15)
 
 
 def default_data_dir() -> Path:
@@ -292,31 +312,46 @@ class CDPClient:
         self.next_id = 0
         self.pending_events: list[dict[str, Any]] = []
         self._heartbeat_binding_installed = False
+        self._enabled_commands: dict[str, dict[str, Any]] = {}
         self._navigate_count = 0
-        self._recycle_every = int(os.environ.get("WANDAO_CDP_RECYCLE_NAVIGATIONS", "10"))
+        try:
+            self._recycle_every = max(0, int(os.environ.get("WANDAO_CDP_RECYCLE_NAVIGATIONS", "10")))
+        except ValueError:
+            self._recycle_every = 10
         self._reconnect_attempted = False
+        self._current_url = ""
 
     def connect(self) -> None:
-        sock = socket.create_connection((self.host, self.port), timeout=15)
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            f"GET {self.path} HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        sock.sendall(request.encode("ascii"))
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        if b" 101 " not in response.split(b"\r\n", 1)[0]:
-            raise ExportError(f"DevTools WebSocket handshake failed: {response[:200]!r}")
-        self.sock = sock
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection((self.host, self.port), timeout=15)
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            request = (
+                f"GET {self.path} HTTP/1.1\r\n"
+                f"Host: {self.host}:{self.port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            sock.sendall(request.encode("ascii"))
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            if b" 101 " not in response.split(b"\r\n", 1)[0]:
+                raise CDPConnectionError(f"CDP DevTools WebSocket 握手失败：{response[:200]!r}")
+            self.sock = sock
+        except CDPConnectionError:
+            if sock:
+                sock.close()
+            raise
+        except OSError as exc:
+            if sock:
+                sock.close()
+            raise CDPConnectionError(f"CDP DevTools WebSocket 连接失败：{exc}") from exc
 
     def close(self) -> None:
         if self.sock:
@@ -335,16 +370,32 @@ class CDPClient:
         watchdog: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         try:
-            return self._send_once(method, params, timeout, max_timeout=max_timeout, watchdog=watchdog)
+            response = self._send_once(method, params, timeout, max_timeout=max_timeout, watchdog=watchdog)
+            if method.endswith(".enable"):
+                self._enabled_commands[method] = dict(params or {})
+            elif method.endswith(".disable"):
+                self._enabled_commands.pop(f"{method[:-len('.disable')]}.enable", None)
+            return response
         except CDPConnectionError:
             if self._reconnect_attempted:
                 raise
             self._reconnect_attempted = True
             try:
-                self.reconnect()
+                self.reconnect(force_restart=self._has_registered_launch())
             except Exception:
                 raise
-            return self._send_once(method, params, timeout, max_timeout=max_timeout, watchdog=watchdog)
+            response = self._send_once(
+                method,
+                params,
+                timeout,
+                max_timeout=max_timeout,
+                watchdog=watchdog,
+            )
+            if method.endswith(".enable"):
+                self._enabled_commands[method] = dict(params or {})
+            elif method.endswith(".disable"):
+                self._enabled_commands.pop(f"{method[:-len('.disable')]}.enable", None)
+            return response
         finally:
             self._reconnect_attempted = False
 
@@ -388,6 +439,8 @@ class CDPClient:
                     raise ExportError(
                         f"CDP {method} 看门狗超时：{max(1, int(idle_timeout))} 秒内没有收到页面心跳"
                     ) from exc
+                raise
+            except CDPConnectionError:
                 raise
             except ExportError as exc:
                 if watchdog and time.monotonic() >= deadline:
@@ -468,15 +521,17 @@ class CDPClient:
         # navigations it reaches ~3.5 GB and the OS kills the renderer, dropping
         # the CDP socket. Recycling the browser process every N navigations caps
         # peak memory and avoids the cascade.
-        self._navigate_count += 1
-        if self._recycle_every and self._navigate_count >= self._recycle_every:
+        if (
+            self._recycle_every
+            and self._navigate_count >= self._recycle_every
+            and self._has_registered_launch()
+        ):
+            self._restart_browser()
+            self.reconnect()
             self._navigate_count = 0
-            try:
-                self._restart_browser()
-                self.reconnect()
-            except CDPConnectionError:
-                pass
         self.send("Page.navigate", {"url": url}, timeout=20)
+        self._current_url = url
+        self._navigate_count += 1
 
     def add_binding(self, name: str, *, timeout: float = 15) -> None:
         """Install ``window.<name>`` so page code can raise CDP events.
@@ -547,7 +602,7 @@ class CDPClient:
     # Connection recovery and browser recycling
     # ------------------------------------------------------------------
 
-    def reconnect(self) -> None:
+    def reconnect(self, *, force_restart: bool = False) -> None:
         """Re-establish the CDP connection after a transport-level disconnection.
 
         Closes the dead socket, waits for the debug port to respond, finds an
@@ -556,44 +611,88 @@ class CDPClient:
         is gone, restarts it using recorded or discovered launch info.
         """
 
+        had_heartbeat_binding = self._heartbeat_binding_installed
         self.close()
         self.pending_events.clear()
         self._heartbeat_binding_installed = False
 
-        if not chrome_debug_available(self.port):
-            self._restart_browser()
-
-        wait_for_debug_port(self.port, timeout=20)
-        page_ws = self._find_page_websocket()
-        if not page_ws:
-            raise CDPConnectionError("Debug port is up but no page target was found")
-
-        # Re-parse the websocket URL (host/port/path may differ after restart).
-        parsed = urllib.parse.urlparse(page_ws)
-        if parsed.scheme != "ws":
-            raise CDPConnectionError(f"Unexpected websocket URL after reconnect: {page_ws}")
-        self.host = parsed.hostname or self.host
-        self.port = parsed.port or self.port
-        self.path = parsed.path + (("?" + parsed.query) if parsed.query else "")
-        self.next_id = 0
-        self.connect()
         try:
-            self.send("Runtime.enable", timeout=10)
-            self.send("Page.enable", timeout=10)
-        except ExportError:
-            pass
+            if force_restart or not chrome_debug_available(self.port):
+                if not self._has_registered_launch():
+                    raise CDPConnectionError(
+                        "浏览器连接已断开，但当前没有本任务启动的浏览器可安全重启。"
+                    )
+                self._restart_browser()
+            wait_for_debug_port(self.port, timeout=20)
+            target_url = self._current_url
+            page_ws = self._find_page_websocket(target_url)
+            if not page_ws and self._has_registered_launch():
+                self._restart_browser()
+                wait_for_debug_port(self.port, timeout=20)
+                page_ws = self._find_page_websocket(target_url)
+            if not page_ws:
+                raise CDPConnectionError(
+                    f"CDP 调试端口已恢复，但没有找到当前飞书页面：{target_url or '未知页面'}"
+                )
 
-    def _find_page_websocket(self) -> str | None:
-        """Query ``/json/list`` for a page-type target and return its ws URL."""
+            # Re-parse the websocket URL (host/port/path may differ after restart).
+            parsed = urllib.parse.urlparse(page_ws)
+            if parsed.scheme != "ws":
+                raise CDPConnectionError(f"CDP 恢复后返回了无效页面地址：{page_ws}")
+            self.host = parsed.hostname or self.host
+            self.port = parsed.port or self.port
+            self.path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+            self.next_id = 0
+            self.connect()
+            for method, params in self._enabled_commands.items():
+                self._send_once(method, params, timeout=10)
+            if had_heartbeat_binding:
+                self._send_once("Runtime.addBinding", {"name": HEARTBEAT_BINDING_NAME}, timeout=10)
+                self._heartbeat_binding_installed = True
+                self._send_once(
+                    "Runtime.evaluate",
+                    {"expression": HEARTBEAT_BRIDGE_JS, "returnByValue": True},
+                    timeout=10,
+                )
+        except CDPConnectionError:
+            self.close()
+            raise
+        except Exception as exc:
+            self.close()
+            raise CDPConnectionError(f"CDP 浏览器连接恢复失败：{exc}") from exc
+
+    def _has_registered_launch(self) -> bool:
+        info = _browser_launch_info.get(self.port)
+        return bool(info and info.get("pid") and info.get("exe") and info.get("profile_dir"))
+
+    def _find_page_websocket(self, target_url: str = "") -> str | None:
+        """Find the page target matching the current URL, not an arbitrary tab."""
 
         try:
             pages = http_json(f"http://127.0.0.1:{self.port}/json/list", timeout=5)
         except Exception:
             return None
-        for page in pages:
-            if page.get("type") == "page" and page.get("webSocketDebuggerUrl"):
-                return page["webSocketDebuggerUrl"]
-        return None
+        page_targets = [
+            page for page in pages
+            if page.get("type") == "page" and page.get("webSocketDebuggerUrl")
+        ]
+        if not target_url:
+            return str(page_targets[0]["webSocketDebuggerUrl"]) if page_targets else None
+        expected = urllib.parse.urlparse(target_url)
+        expected_host = expected.netloc.lower()
+        expected_path = expected.path.rstrip("/") or "/"
+        for page in page_targets:
+            actual = urllib.parse.urlparse(str(page.get("url") or ""))
+            if (
+                actual.netloc.lower() == expected_host
+                and (actual.path.rstrip("/") or "/") == expected_path
+            ):
+                return str(page["webSocketDebuggerUrl"])
+        same_host = [
+            page for page in page_targets
+            if urllib.parse.urlparse(str(page.get("url") or "")).netloc.lower() == expected_host
+        ]
+        return str(same_host[0]["webSocketDebuggerUrl"]) if len(same_host) == 1 else None
 
     def _find_launch_info(self) -> dict[str, Any] | None:
         """Locate the Chrome executable, profile directory, and PID.
@@ -606,7 +705,7 @@ class CDPClient:
 
         # 1. In-process registry
         info = _browser_launch_info.get(self.port)
-        if info:
+        if info and info.get("pid"):
             return info
 
         # 2. CDP query (best-effort; may be rejected without --enable-automation)
@@ -643,48 +742,49 @@ class CDPClient:
     def _restart_browser(self) -> None:
         """Kill the browser process tree and relaunch with the same profile."""
 
-        info = self._find_launch_info()
-        if not info:
+        info = _browser_launch_info.get(self.port)
+        if not info or not info.get("pid"):
             raise CDPConnectionError(
-                "无法确定浏览器启动信息（可执行文件和 profile 目录），无法自动重启。"
+                "当前浏览器不是由本任务启动的，无法安全地自动回收或重启。"
             )
 
-        pid = info.get("pid")
-        if pid:
+        pid = int(info["pid"])
+        registered_proc = info.get("proc")
+        if registered_proc is None or registered_proc.poll() is None:
             self._kill_process_tree(pid)
+        wait_for_debug_port_closed(self.port, timeout=15)
 
         exe = info["exe"]
         profile_dir = Path(info["profile_dir"])
-        launch_url = "about:blank"
-        subprocess.Popen(
+        launch_url = self._current_url or str(info.get("url") or "about:blank")
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
             [
                 exe,
                 f"--remote-debugging-port={self.port}",
                 f"--user-data-dir={profile_dir}",
+                "--enable-automation",
                 "--no-first-run",
                 "--disable-popup-blocking",
                 launch_url,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            start_new_session=os.name != "nt",
         )
-        # Update registry so subsequent restarts find the new PID.
+        register_browser_launch(
+            self.port,
+            exe=exe,
+            profile_dir=profile_dir,
+            proc=proc,
+            url=launch_url,
+        )
         wait_for_debug_port(self.port, timeout=20)
 
     @staticmethod
     def _kill_process_tree(pid: int) -> None:
-        try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10,
-                )
-            else:
-                os.kill(pid, 9)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        terminate_pid_tree(pid)
 
     def _send_text(self, text: str) -> None:
         assert self.sock is not None
@@ -728,7 +828,7 @@ class CDPClient:
             if masked:
                 payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
             if opcode == 0x8:
-                raise ExportError("DevTools WebSocket closed")
+                raise CDPConnectionError("DevTools WebSocket closed")
             if opcode == 0x9:
                 self._send_pong(payload)
                 continue
@@ -853,8 +953,9 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=creation_flags,
+        start_new_session=os.name != "nt",
     )
-    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc)
+    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc, url=url)
     return proc
 
 
@@ -867,6 +968,65 @@ def wait_for_debug_port(port: int, timeout: int = 30) -> None:
             return
         time.sleep(1)
     raise ExportError(debug_port_error_message(port, status, detail))
+
+
+def wait_for_debug_port_closed(port: int, timeout: int = 15) -> None:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        status, _detail = debug_port_probe(port)
+        if status == "closed":
+            return
+        time.sleep(0.25)
+    raise CDPConnectionError(f"浏览器调试端口 {port} 在结束旧进程后仍被占用")
+
+
+def terminate_pid_tree(pid: int, timeout: float = 10) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def terminate_process_tree(process: subprocess.Popen[Any], timeout: float = 10) -> None:
+    if process.poll() is not None:
+        return
+    terminate_pid_tree(int(process.pid), timeout=timeout)
+    try:
+        process.wait(timeout=max(0.1, timeout))
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            try:
+                process.kill()
+            except OSError:
+                pass
+        else:
+            try:
+                os.killpg(int(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def open_tab(port: int, url: str) -> None:

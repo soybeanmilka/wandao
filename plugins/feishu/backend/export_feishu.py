@@ -68,6 +68,7 @@ from wandao_core.browser import (
     sanitize_filename,
     stop_requested,
     throttle_request,
+    terminate_registered_browser,
     wait_for_debug_port,
 )
 
@@ -193,6 +194,7 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
             "or set WANDAO_BROWSER to the browser executable path."
         )
     profile_dir.mkdir(parents=True, exist_ok=True)
+    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     proc = subprocess.Popen(
         [
             chrome,
@@ -205,8 +207,10 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=creation_flags,
+        start_new_session=os.name != "nt",
     )
-    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc)
+    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc, url=url)
     return proc
 
 
@@ -3171,7 +3175,7 @@ def scan_wiki_toc(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             cdp.close()
             if chrome_proc and args.close_started_chrome:
-                chrome_proc.terminate()
+                terminate_registered_browser(args.port)
 
     if kind != "wiki":
         cdp, chrome_proc = connect_entry_browser(args, entry_url, host)
@@ -3204,7 +3208,7 @@ def scan_wiki_toc(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             cdp.close()
             if chrome_proc and args.close_started_chrome:
-                chrome_proc.terminate()
+                terminate_registered_browser(args.port)
 
     wiki_url = entry_url
     cdp, chrome_proc = connect_wiki_browser(args, wiki_url, host, start_token)
@@ -3227,7 +3231,7 @@ def scan_wiki_toc(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         cdp.close()
         if chrome_proc and args.close_started_chrome:
-            chrome_proc.terminate()
+            terminate_registered_browser(args.port)
 
 
 def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
@@ -3341,6 +3345,8 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
         failures: list[dict[str, str]] = []
         image_failures: list[dict[str, Any]] = []
         stopped = False
+        connection_aborted = False
+        abort_reason = ""
 
         emit(
             args,
@@ -3496,23 +3502,30 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                 emit(args, "收到停止请求，当前文档未写入，正在结束。")
                 break
             except CDPConnectionError as exc:
+                connection_aborted = True
+                abort_reason = f"浏览器连接中断，已中止后续文档：{exc}"
                 if checkpoint:
-                    checkpoint.fail_item(item_key, f"浏览器连接中断：{exc}")
+                    checkpoint.fail_item(item_key, abort_reason)
                 failures.append({
                     "title": doc.get("title") or "",
                     "documentUrl": document_url,
                     "wiki_token": token,
-                    "error": f"浏览器连接中断：{exc}",
+                    "error": abort_reason,
                 })
                 emit(
                     args,
-                    f"浏览器连接中断，任务已中止（已完成 {exported} 篇，剩余文档可通过断点续跑重试）：{exc}",
+                    abort_reason,
                     event="document.export.failed",
                     level="error",
                     doc={"id": token, "title": doc.get("title") or "", "url": document_url, "index": index, "path": str(md_path)},
-                    error={"type": "CDPConnectionError", "message": str(exc)},
+                    error={
+                        "type": "CDPConnectionError",
+                        "code": "CDP_CONNECTION_LOST",
+                        "category": "browser",
+                        "message": str(exc),
+                        "retryable": True,
+                    },
                 )
-                stopped = True
                 break
             except Exception as exc:
                 if checkpoint:
@@ -3563,6 +3576,8 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
             "exportedDocs": exported,
             "skippedDocs": skipped,
             "stopped": stopped,
+            "aborted": connection_aborted,
+            "abortReason": abort_reason,
             "imageSuccess": image_success,
             "imageFailureCount": sum(len(item["failures"]) for item in image_failures),
             "resourceFailureCount": sum(len(item["failures"]) for item in image_failures),
@@ -3590,9 +3605,29 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                 checkpoint.complete_task(report)
         emit(
             args,
-            "飞书导出完成" if not stopped else "飞书导出已停止",
-            event="task.completed" if not stopped else "task.stopped",
-            level="success" if not stopped and not failures and not image_failures else "warn",
+            (
+                "飞书导出已停止"
+                if stopped
+                else abort_reason
+                if connection_aborted
+                else "飞书导出完成"
+            ),
+            event=(
+                "task.stopped"
+                if stopped
+                else "task.failed"
+                if connection_aborted
+                else "task.completed"
+            ),
+            level=(
+                "warn"
+                if stopped
+                else "error"
+                if connection_aborted
+                else "success"
+                if not failures and not image_failures
+                else "warn"
+            ),
             reportFile=str(report_path),
             stats={
                 "exportedDocs": exported,
@@ -3606,7 +3641,7 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         cdp.close()
         if chrome_proc and args.close_started_chrome:
-            chrome_proc.terminate()
+            terminate_registered_browser(args.port)
         if checkpoint:
             checkpoint.close()
 
@@ -3642,7 +3677,7 @@ def login_and_save_auth(args: argparse.Namespace, wait_callback: Callable[[], No
     finally:
         cdp.close()
         if chrome_proc and args.close_started_chrome:
-            chrome_proc.terminate()
+            terminate_registered_browser(args.port)
 
 
 def run_gui() -> int:
