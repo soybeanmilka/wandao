@@ -33,8 +33,38 @@ class CDPTimeoutError(ExportError):
     """A socket-level read timeout, distinct from a watchdog timeout."""
 
 
+class CDPConnectionError(ExportError):
+    """The CDP transport layer was reset (socket closed, EOF, connection refused).
+
+    This is distinct from a timeout: the socket is dead and the client should
+    reconnect before retrying rather than treating the current command as a
+    per-item failure.
+    """
+
+
 class ExportStopped(ExportError):
     pass
+
+
+# Registry: debug port -> launch info recorded by ``start_chrome`` in this
+# process. CDPClient uses this to restart a browser it did not itself launch.
+_browser_launch_info: dict[int, dict[str, Any]] = {}
+
+
+def register_browser_launch(
+    port: int,
+    *,
+    exe: str,
+    profile_dir: Path,
+    proc: subprocess.Popen[Any] | None = None,
+) -> None:
+    """Record how a Chrome process was started so it can be restarted later."""
+
+    _browser_launch_info[port] = {
+        "exe": exe,
+        "profile_dir": str(profile_dir),
+        "pid": getattr(proc, "pid", None),
+    }
 
 
 def default_data_dir() -> Path:
@@ -262,6 +292,9 @@ class CDPClient:
         self.next_id = 0
         self.pending_events: list[dict[str, Any]] = []
         self._heartbeat_binding_installed = False
+        self._navigate_count = 0
+        self._recycle_every = int(os.environ.get("WANDAO_CDP_RECYCLE_NAVIGATIONS", "10"))
+        self._reconnect_attempted = False
 
     def connect(self) -> None:
         sock = socket.create_connection((self.host, self.port), timeout=15)
@@ -301,12 +334,38 @@ class CDPClient:
         max_timeout: float | None = None,
         watchdog: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
+        try:
+            return self._send_once(method, params, timeout, max_timeout=max_timeout, watchdog=watchdog)
+        except CDPConnectionError:
+            if self._reconnect_attempted:
+                raise
+            self._reconnect_attempted = True
+            try:
+                self.reconnect()
+            except Exception:
+                raise
+            return self._send_once(method, params, timeout, max_timeout=max_timeout, watchdog=watchdog)
+        finally:
+            self._reconnect_attempted = False
+
+    def _send_once(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        timeout: float,
+        *,
+        max_timeout: float | None = None,
+        watchdog: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
         if not self.sock:
-            raise ExportError("CDP socket is not connected")
+            raise CDPConnectionError("CDP socket is not connected")
         self.next_id += 1
         msg_id = self.next_id
         payload = json.dumps({"id": msg_id, "method": method, "params": params or {}}, ensure_ascii=False)
-        self._send_text(payload)
+        try:
+            self._send_text(payload)
+        except OSError as exc:
+            raise CDPConnectionError(f"CDP {method} 发送失败：{exc}") from exc
         idle_timeout = max(0.5, float(timeout))
         started = time.monotonic()
         hard_deadline = (
@@ -405,6 +464,18 @@ class CDPClient:
         return result.get("result", {}).get("value")
 
     def navigate(self, url: str) -> None:
+        # Chrome renderer memory grows ~85-110 MB per navigation; after ~35
+        # navigations it reaches ~3.5 GB and the OS kills the renderer, dropping
+        # the CDP socket. Recycling the browser process every N navigations caps
+        # peak memory and avoids the cascade.
+        self._navigate_count += 1
+        if self._recycle_every and self._navigate_count >= self._recycle_every:
+            self._navigate_count = 0
+            try:
+                self._restart_browser()
+                self.reconnect()
+            except CDPConnectionError:
+                pass
         self.send("Page.navigate", {"url": url}, timeout=20)
 
     def add_binding(self, name: str, *, timeout: float = 15) -> None:
@@ -472,6 +543,149 @@ class CDPClient:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # Connection recovery and browser recycling
+    # ------------------------------------------------------------------
+
+    def reconnect(self) -> None:
+        """Re-establish the CDP connection after a transport-level disconnection.
+
+        Closes the dead socket, waits for the debug port to respond, finds an
+        available page target, reconnects, and re-issues Runtime.enable /
+        Page.enable plus the heartbeat binding. If the browser process itself
+        is gone, restarts it using recorded or discovered launch info.
+        """
+
+        self.close()
+        self.pending_events.clear()
+        self._heartbeat_binding_installed = False
+
+        if not chrome_debug_available(self.port):
+            self._restart_browser()
+
+        wait_for_debug_port(self.port, timeout=20)
+        page_ws = self._find_page_websocket()
+        if not page_ws:
+            raise CDPConnectionError("Debug port is up but no page target was found")
+
+        # Re-parse the websocket URL (host/port/path may differ after restart).
+        parsed = urllib.parse.urlparse(page_ws)
+        if parsed.scheme != "ws":
+            raise CDPConnectionError(f"Unexpected websocket URL after reconnect: {page_ws}")
+        self.host = parsed.hostname or self.host
+        self.port = parsed.port or self.port
+        self.path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        self.next_id = 0
+        self.connect()
+        try:
+            self.send("Runtime.enable", timeout=10)
+            self.send("Page.enable", timeout=10)
+        except ExportError:
+            pass
+
+    def _find_page_websocket(self) -> str | None:
+        """Query ``/json/list`` for a page-type target and return its ws URL."""
+
+        try:
+            pages = http_json(f"http://127.0.0.1:{self.port}/json/list", timeout=5)
+        except Exception:
+            return None
+        for page in pages:
+            if page.get("type") == "page" and page.get("webSocketDebuggerUrl"):
+                return page["webSocketDebuggerUrl"]
+        return None
+
+    def _find_launch_info(self) -> dict[str, Any] | None:
+        """Locate the Chrome executable, profile directory, and PID.
+
+        Lookup order:
+        1. In-process registry populated by :func:`start_chrome`.
+        2. ``Browser.getBrowserCommandLine`` (only works with --enable-automation).
+        3. Directory convention: ``$WANDAO_PLUGIN_DATA_DIR/.*chrome-profile``.
+        """
+
+        # 1. In-process registry
+        info = _browser_launch_info.get(self.port)
+        if info:
+            return info
+
+        # 2. CDP query (best-effort; may be rejected without --enable-automation)
+        try:
+            result = self.send("Browser.getBrowserCommandLine", timeout=5)
+            argv = result.get("result", {}).get("arguments", [])
+            if argv:
+                exe = argv[0]
+                profile = None
+                for arg in argv:
+                    if arg.startswith("--user-data-dir="):
+                        profile = arg[len("--user-data-dir="):]
+                if exe and profile:
+                    return {"exe": exe, "profile_dir": profile, "pid": None}
+        except ExportError:
+            pass
+
+        # 3. Directory convention fallback
+        return self._guess_launch_info()
+
+    def _guess_launch_info(self) -> dict[str, Any] | None:
+        """Find a ``*chrome-profile*`` directory under the plugin data dir."""
+
+        data_dir = default_data_dir()
+        if not data_dir.exists():
+            return None
+        for child in sorted(data_dir.iterdir()):
+            if child.is_dir() and "chrome-profile" in child.name:
+                exe = find_chrome()
+                if exe:
+                    return {"exe": exe, "profile_dir": str(child), "pid": None}
+        return None
+
+    def _restart_browser(self) -> None:
+        """Kill the browser process tree and relaunch with the same profile."""
+
+        info = self._find_launch_info()
+        if not info:
+            raise CDPConnectionError(
+                "无法确定浏览器启动信息（可执行文件和 profile 目录），无法自动重启。"
+            )
+
+        pid = info.get("pid")
+        if pid:
+            self._kill_process_tree(pid)
+
+        exe = info["exe"]
+        profile_dir = Path(info["profile_dir"])
+        launch_url = "about:blank"
+        subprocess.Popen(
+            [
+                exe,
+                f"--remote-debugging-port={self.port}",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--disable-popup-blocking",
+                launch_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Update registry so subsequent restarts find the new PID.
+        wait_for_debug_port(self.port, timeout=20)
+
+    @staticmethod
+    def _kill_process_tree(pid: int) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            else:
+                os.kill(pid, 9)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
     def _send_text(self, text: str) -> None:
         assert self.sock is not None
         payload = text.encode("utf-8")
@@ -495,7 +709,7 @@ class CDPClient:
         except TimeoutError as exc:
             raise CDPTimeoutError(f"CDP {label} 通信超时或中断：{exc}") from exc
         except OSError as exc:
-            raise ExportError(f"CDP {label} 通信中断：{exc}") from exc
+            raise CDPConnectionError(f"CDP {label} 通信中断：{exc}") from exc
 
     def _recv_json(self, timeout: float) -> dict[str, Any]:
         assert self.sock is not None
@@ -534,7 +748,7 @@ class CDPClient:
         while len(chunks) < size:
             chunk = self.sock.recv(size - len(chunks))
             if not chunk:
-                raise ExportError("Unexpected EOF from DevTools WebSocket")
+                raise CDPConnectionError("Unexpected EOF from DevTools WebSocket")
             chunks.extend(chunk)
         return bytes(chunks)
 
@@ -626,12 +840,22 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
         raise ExportError("未找到 Chrome、Edge 或 Chromium，请先在万能导设置中选择自动化浏览器。")
     profile_dir.mkdir(parents=True, exist_ok=True)
     creation_flags = 0x01000000 if breakaway and os.name == "nt" else 0
-    return subprocess.Popen(
-        [chrome, f"--remote-debugging-port={port}", f"--user-data-dir={profile_dir}", "--no-first-run", "--disable-popup-blocking", url],
+    proc = subprocess.Popen(
+        [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            "--enable-automation",
+            "--no-first-run",
+            "--disable-popup-blocking",
+            url,
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=creation_flags,
     )
+    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc)
+    return proc
 
 
 def wait_for_debug_port(port: int, timeout: int = 30) -> None:

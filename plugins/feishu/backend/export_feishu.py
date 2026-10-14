@@ -50,6 +50,7 @@ from typing import Any, Callable
 
 from wandao_core.browser import (
     CDPClient,
+    CDPConnectionError,
     DEFAULT_PORT,
     ExportError,
     ExportStopped,
@@ -63,6 +64,7 @@ from wandao_core.browser import (
     js_string,
     pad,
     prepare_cookie_for_set,
+    register_browser_launch,
     sanitize_filename,
     stop_requested,
     throttle_request,
@@ -191,11 +193,12 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
             "or set WANDAO_BROWSER to the browser executable path."
         )
     profile_dir.mkdir(parents=True, exist_ok=True)
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [
             chrome,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile_dir}",
+            "--enable-automation",
             "--no-first-run",
             "--disable-popup-blocking",
             url,
@@ -203,6 +206,8 @@ def start_chrome(port: int, profile_dir: Path, url: str, browser_path: str | Non
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    register_browser_launch(port, exe=chrome, profile_dir=profile_dir, proc=proc)
+    return proc
 
 
 def open_tab(port: int, url: str) -> None:
@@ -3489,6 +3494,25 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                     checkpoint.fail_item(item_key, "stopped")
                 stopped = True
                 emit(args, "收到停止请求，当前文档未写入，正在结束。")
+                break
+            except CDPConnectionError as exc:
+                if checkpoint:
+                    checkpoint.fail_item(item_key, f"浏览器连接中断：{exc}")
+                failures.append({
+                    "title": doc.get("title") or "",
+                    "documentUrl": document_url,
+                    "wiki_token": token,
+                    "error": f"浏览器连接中断：{exc}",
+                })
+                emit(
+                    args,
+                    f"浏览器连接中断，任务已中止（已完成 {exported} 篇，剩余文档可通过断点续跑重试）：{exc}",
+                    event="document.export.failed",
+                    level="error",
+                    doc={"id": token, "title": doc.get("title") or "", "url": document_url, "index": index, "path": str(md_path)},
+                    error={"type": "CDPConnectionError", "message": str(exc)},
+                )
+                stopped = True
                 break
             except Exception as exc:
                 if checkpoint:
