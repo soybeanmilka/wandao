@@ -1204,7 +1204,12 @@ FEISHU_TREE_LOADER_JS = r"""
 async (startToken) => {
   const watchdogPrefix = "__WANDAO_FEISHU_TREE_WATCHDOG__";
   const heartbeat = (phase, nodes = 0) => {
-    try { console.info(watchdogPrefix + JSON.stringify({phase, nodes})); } catch (err) {}
+    try {
+      const message = watchdogPrefix + JSON.stringify({phase, nodes});
+      const binding = globalThis && globalThis.__wandaoHeartbeat;
+      if (typeof binding === "function") { binding(message); return; }
+      console.info(message);
+    } catch (err) {}
   };
   const heartbeatTimer = setInterval(() => heartbeat("等待目录接口"), 5000);
   heartbeat("开始读取目录");
@@ -1324,7 +1329,12 @@ FEISHU_DRIVE_FOLDER_LOADER_JS = r"""
 async (startToken) => {
   const watchdogPrefix = "__WANDAO_FEISHU_TREE_WATCHDOG__";
   const heartbeat = (phase, nodes = 0) => {
-    try { console.info(watchdogPrefix + JSON.stringify({phase, nodes})); } catch (err) {}
+    try {
+      const message = watchdogPrefix + JSON.stringify({phase, nodes});
+      const binding = globalThis && globalThis.__wandaoHeartbeat;
+      if (typeof binding === "function") { binding(message); return; }
+      console.info(message);
+    } catch (err) {}
   };
   const heartbeatTimer = setInterval(() => heartbeat("等待云空间接口"), 5000);
   heartbeat("开始读取云空间目录");
@@ -1611,13 +1621,16 @@ async (fallbackTitle) => {
   const ZERO = /[\u200b\u200c\u200d\ufeff]/g;
   const watchdogPulse = (phase, payload = {}) => {
     try {
-      const consoleApi = globalThis && globalThis.console;
-      if (!consoleApi || typeof consoleApi.debug !== "function") return;
-      consoleApi.debug("__WANDAO_FEISHU_WATCHDOG__" + JSON.stringify({
+      const message = "__WANDAO_FEISHU_WATCHDOG__" + JSON.stringify({
         phase,
         ...payload,
         timestamp: Date.now(),
-      }));
+      });
+      const binding = globalThis && globalThis.__wandaoHeartbeat;
+      if (typeof binding === "function") { binding(message); return; }
+      const consoleApi = globalThis && globalThis.console;
+      if (!consoleApi || typeof consoleApi.debug !== "function") return;
+      consoleApi.debug(message);
     } catch (_) {}
   };
   function clean(value) {

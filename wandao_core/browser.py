@@ -108,39 +108,75 @@ def throttle_request(args: argparse.Namespace | None) -> None:
     args._request_count = int(getattr(args, "_request_count", 0) or 0) + 1
 
 
+HEARTBEAT_BINDING_NAME = "__wandaoHeartbeat"
+
+# Every Wandao page-side heartbeat payload starts with this marker. The console
+# bridge only forwards strings carrying it, so a page's own console calls keep
+# reaching whatever implementation the page installed.
+HEARTBEAT_MARKER = "__WANDAO_"
+
+# Injected into the page before a watchdog-guarded evaluation. Production web
+# apps routinely replace console.log/info/warn with no-op stubs, which silently
+# swallows console-based heartbeats. This forwards only Wandao heartbeat strings
+# to a browser-owned binding and delegates every other call to the page's
+# original console method, so page behaviour is unchanged.
+HEARTBEAT_BRIDGE_JS = r"""
+(() => {
+  const globalObject = globalThis;
+  if (!globalObject) return false;
+  const binding = globalObject["__wandaoHeartbeat"];
+  if (typeof binding !== "function") return false;
+  const marker = "__WANDAO_";
+  const consoleObject = globalObject.console;
+  if (!consoleObject) return false;
+  for (const name of ["info", "log", "debug", "warn", "error"]) {
+    const original = consoleObject[name];
+    if (typeof original !== "function" || original.__wandaoHeartbeatBridge) continue;
+    const patched = function (...args) {
+      try {
+        const first = args[0];
+        if (typeof first === "string" && first.indexOf(marker) === 0) {
+          binding(first);
+        }
+      } catch (_) {}
+      return original.apply(this, args);
+    };
+    patched.__wandaoHeartbeatBridge = true;
+    try { consoleObject[name] = patched; } catch (_) {}
+  }
+  return true;
+})()
+"""
+
+
 def console_heartbeat_watchdog(
     prefix: str,
     on_heartbeat: Callable[[dict[str, Any], int], None] | None = None,
+    *,
+    binding_name: str = HEARTBEAT_BINDING_NAME,
 ) -> Callable[[dict[str, Any]], bool]:
     """Renew a CDP evaluation when the page emits a structured heartbeat.
 
     Long page-side JavaScript often performs several sequential fetches and
     DOM operations inside one awaited ``Runtime.evaluate`` call.  Providers
-    can emit ``console.info(prefix + JSON payload)`` from that script and use
-    this callback as an idle watchdog while retaining a separate hard limit.
+    can emit heartbeats from that script and use this callback as an idle
+    watchdog while retaining a separate hard limit.
+
+    Two channels are recognized:
+
+    * ``Runtime.consoleAPICalled`` for ``console.log(prefix + JSON payload)``.
+    * ``Runtime.bindingCalled`` for the browser-owned binding installed by
+      :meth:`CDPClient.ensure_heartbeat_bridge`.  Production web apps (Feishu
+      included) replace ``console.log``/``console.info``/``console.warn`` with
+      no-op stubs, which silently swallows console heartbeats and makes a
+      perfectly healthy page look hung; a binding cannot be silenced by page
+      code.
     """
 
     started = time.monotonic()
 
-    def observe(message: dict[str, Any]) -> bool:
-        if message.get("method") != "Runtime.consoleAPICalled":
-            return False
-        params = message.get("params")
-        if not isinstance(params, dict):
-            return False
-        values = params.get("args")
-        if not isinstance(values, list):
-            return False
-        raw = next(
-            (
-                str(item.get("value") or "")
-                for item in values
-                if isinstance(item, dict)
-                and str(item.get("value") or "").startswith(prefix)
-            ),
-            "",
-        )
-        if not raw:
+    def deliver(raw: str) -> bool:
+        if not raw or not raw.startswith(prefix):
             return False
         payload: dict[str, Any] = {}
         encoded = raw[len(prefix) :].strip()
@@ -156,7 +192,60 @@ def console_heartbeat_watchdog(
             on_heartbeat(payload, payload["elapsedSeconds"])
         return True
 
+    def observe(message: dict[str, Any]) -> bool:
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return False
+        method = message.get("method")
+        if method == "Runtime.consoleAPICalled":
+            values = params.get("args")
+            if not isinstance(values, list):
+                return False
+            raw = next(
+                (
+                    str(item.get("value") or "")
+                    for item in values
+                    if isinstance(item, dict)
+                    and str(item.get("value") or "").startswith(prefix)
+                ),
+                "",
+            )
+            return deliver(raw)
+        if method == "Runtime.bindingCalled":
+            if not binding_name or str(params.get("name") or "") != binding_name:
+                return False
+            return deliver(str(params.get("payload") or ""))
+        return False
+
     return observe
+
+
+def heartbeat_as_console_event(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Re-shape a binding heartbeat as a ``Runtime.consoleAPICalled`` event.
+
+    Plugins written before the binding channel existed inspect
+    ``Runtime.consoleAPICalled`` directly in their own watchdog callbacks.
+    Rather than requiring every plugin to learn the new channel, the client
+    replays binding heartbeats in the shape those observers already understand.
+    """
+
+    if message.get("method") != "Runtime.bindingCalled":
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    payload = str(params.get("payload") or "")
+    if not payload.startswith(HEARTBEAT_MARKER):
+        return None
+    return {
+        "method": "Runtime.consoleAPICalled",
+        "params": {
+            "type": "info",
+            "args": [{"type": "string", "value": payload}],
+            "executionContextId": params.get("executionContextId"),
+            "timestamp": time.time() * 1000.0,
+        },
+    }
 
 
 class CDPClient:
@@ -172,6 +261,7 @@ class CDPClient:
         self.sock: socket.socket | None = None
         self.next_id = 0
         self.pending_events: list[dict[str, Any]] = []
+        self._heartbeat_binding_installed = False
 
     def connect(self) -> None:
         sock = socket.create_connection((self.host, self.port), timeout=15)
@@ -255,11 +345,7 @@ class CDPClient:
                     raise ExportError(f"CDP {method} failed: {message['error']}")
                 return message
             if message.get("method"):
-                try:
-                    renewed = bool(watchdog(message)) if watchdog else False
-                except Exception:
-                    renewed = False
-                if renewed:
+                if watchdog and self._watchdog_renewed(watchdog, message):
                     deadline = time.monotonic() + idle_timeout
                     if hard_deadline is not None:
                         deadline = min(deadline, hard_deadline)
@@ -269,9 +355,9 @@ class CDPClient:
                 raise ExportError(
                     f"CDP {method} 看门狗达到最大执行时间：{int(max_timeout or 0)} 秒"
                 )
-                raise ExportError(
-                    f"CDP {method} 看门狗超时：{max(1, int(idle_timeout))} 秒内没有收到页面心跳"
-                )
+            raise ExportError(
+                f"CDP {method} 看门狗超时：{max(1, int(idle_timeout))} 秒内没有收到页面心跳"
+            )
         raise ExportError(f"Timed out waiting for CDP response: {method}")
 
     def wait_for_event(
@@ -304,6 +390,8 @@ class CDPClient:
         max_timeout: float | None = None,
         watchdog: Callable[[dict[str, Any]], bool] | None = None,
     ) -> Any:
+        if watchdog is not None:
+            self.ensure_heartbeat_bridge()
         response = self.send(
             "Runtime.evaluate",
             {"expression": expression, "returnByValue": True, "awaitPromise": True},
@@ -318,6 +406,71 @@ class CDPClient:
 
     def navigate(self, url: str) -> None:
         self.send("Page.navigate", {"url": url}, timeout=20)
+
+    def add_binding(self, name: str, *, timeout: float = 15) -> None:
+        """Install ``window.<name>`` so page code can raise CDP events.
+
+        Bindings are created by the browser rather than by the page, so unlike
+        ``console.*`` they cannot be replaced with a no-op stub by page code.
+        The page calls ``window.<name>(text)`` and the client receives a
+        ``Runtime.bindingCalled`` event. The binding is also installed on
+        execution contexts created later, so it survives page navigations.
+        """
+
+        self.send("Runtime.addBinding", {"name": name}, timeout=timeout)
+
+    def ensure_heartbeat_bridge(self) -> bool:
+        """Make page-side heartbeats observable even when console is stubbed.
+
+        Best effort: any failure simply leaves the original console channel in
+        place, so older browsers or restricted pages behave as before.
+        """
+
+        if not self._heartbeat_binding_installed:
+            try:
+                self.add_binding(HEARTBEAT_BINDING_NAME)
+            except ExportError:
+                return False
+            self._heartbeat_binding_installed = True
+        # The binding survives navigation, but the console shim lives in the
+        # page's JavaScript context and does not; re-inject it every time. The
+        # script is idempotent per context, so repeat calls are cheap.
+        try:
+            self.send(
+                "Runtime.evaluate",
+                {"expression": HEARTBEAT_BRIDGE_JS, "returnByValue": True},
+                timeout=15,
+            )
+        except ExportError:
+            return False
+        return True
+
+    def _watchdog_renewed(
+        self,
+        watchdog: Callable[[dict[str, Any]], bool],
+        message: dict[str, Any],
+    ) -> bool:
+        """Ask a watchdog whether an incoming event proves the page is alive.
+
+        A binding heartbeat is first offered in its native shape, then replayed
+        as a ``Runtime.consoleAPICalled`` event so plugin-side watchdogs that
+        only understand the console channel keep renewing.
+        """
+
+        try:
+            if watchdog(message):
+                return True
+        except Exception:
+            # A watchdog that only understands the console shape may raise on a
+            # native binding event; fall through and offer the replayed form.
+            pass
+        replayed = heartbeat_as_console_event(message)
+        if replayed is None:
+            return False
+        try:
+            return bool(watchdog(replayed))
+        except Exception:
+            return False
 
     def _send_text(self, text: str) -> None:
         assert self.sock is not None
